@@ -166,7 +166,14 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  const temporaryFile = `${jobFile}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+  try {
+    fs.writeFileSync(temporaryFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+    fs.renameSync(temporaryFile, jobFile);
+  } catch (error) {
+    fs.rmSync(temporaryFile, { force: true });
+    throw error;
+  }
   return jobFile;
 }
 

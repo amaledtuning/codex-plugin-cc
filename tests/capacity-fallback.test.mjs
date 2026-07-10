@@ -32,6 +32,7 @@ const ZERO_EVIDENCE = {
   agentMessageSeen: false,
   finalAnswerSeen: false,
   collaborationSeen: false,
+  subagentActivity: false,
   commandExecutions: [],
   fileChanges: [],
   messages: []
@@ -74,6 +75,32 @@ test("zero evidence rejects every observed activity class", () => {
     { messages: [{}] }
   ]) {
     assert.equal(hasZeroExecutionEvidence(evidence), false);
+  }
+});
+
+test("zero evidence fails closed for absent, empty, and malformed evidence", () => {
+  for (const evidence of [
+    undefined,
+    null,
+    {},
+    [],
+    { ...ZERO_EVIDENCE, itemEvents: "0" },
+    { ...ZERO_EVIDENCE, commandExecutions: null },
+    { ...ZERO_EVIDENCE, subagentActivity: "false" }
+  ]) {
+    assert.equal(hasZeroExecutionEvidence(evidence), false);
+    assert.equal(
+      evaluateCapacityFallbackEligibility({
+        mode: "noncritical",
+        jobClass: "task",
+        write: false,
+        model: "gpt-5.6-sol",
+        effort: "high",
+        prompt: "read-only investigation",
+        evidence
+      }).eligible,
+      false
+    );
   }
 });
 
@@ -257,6 +284,36 @@ test("state machine does not retry after activity or cancellation reread", async
   });
   assert.equal(attempts, 1);
   assert.equal(cancelledResult.status, 1);
+});
+
+test("state machine does not run attempt two when cancellation lands at the final start gate", async () => {
+  let attempts = 0;
+  let cancelled = false;
+  const firstFailure = {
+    status: 1,
+    threadId: "thr_cancelled",
+    effectiveModel: "gpt-5.6-sol",
+    effectiveEffort: "high",
+    error: { message: "Selected model is at capacity" },
+    executionEvidence: ZERO_EVIDENCE
+  };
+  const result = await runWithCapacityFallback({
+    mode: "noncritical",
+    jobClass: "task",
+    model: "gpt-5.6-sol",
+    effort: "high",
+    prompt: "inspect",
+    runAttempt: async () => {
+      attempts += 1;
+      return firstFailure;
+    },
+    onFallback: () => {
+      cancelled = true;
+    },
+    beforeAttempt: async () => !cancelled
+  });
+  assert.equal(attempts, 1);
+  assert.equal(result, firstFailure);
 });
 
 test("state machine preserves a thrown capacity error when cancellation blocks retry", async () => {

@@ -521,6 +521,16 @@ async function executeTaskRun(request) {
       if (!claim.acquired) {
         return false;
       }
+      return true;
+    },
+    beforeAttempt: async (retry) => {
+      if (!request.jobId) {
+        return false;
+      }
+      const currentJob = readStoredJob(workspaceRoot, request.jobId);
+      if (!currentJob || currentJob.status === "cancelled") {
+        return false;
+      }
       const persisted = persistCapacityFallbackMetadata({
         workspaceRoot,
         jobId: request.jobId,
@@ -528,11 +538,14 @@ async function executeTaskRun(request) {
         readStoredJob,
         writeJobFile,
         upsertJob,
-        fallbackAt: nowIso()
+        fallbackAt: nowIso(),
+        attemptStarting: true
       });
       if (!persisted) {
         return false;
       }
+      // writeJobFile commits this attempt-state transition by write-then-rename.
+      // Re-read at the final gate so a concurrent cancellation wins before spawn.
       const readyJob = readStoredJob(workspaceRoot, request.jobId);
       return Boolean(readyJob && readyJob.status !== "cancelled");
     },

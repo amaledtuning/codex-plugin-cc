@@ -67,7 +67,8 @@ export function persistCapacityFallbackMetadata({
   readStoredJob,
   writeJobFile,
   upsertJob,
-  fallbackAt = null
+  fallbackAt = null,
+  attemptStarting = false
 }) {
   const storedJob = readStoredJob(workspaceRoot, jobId);
   if (!storedJob || storedJob.status === "cancelled") {
@@ -82,6 +83,7 @@ export function persistCapacityFallbackMetadata({
     capacityFallbackTo: fallback.toModel ?? fallback.model,
     effectiveEffort: fallback.effort,
     mandatoryReview: fallback.effort === "high",
+    ...(attemptStarting ? { status: "running", phase: "starting" } : {}),
     ...(fallbackAt ? { fallbackAt } : {})
   };
   writeJobFile(workspaceRoot, jobId, { ...storedJob, ...patch });
@@ -132,19 +134,25 @@ export function resolveExternalCapacityFallback(model, effort) {
   return fallback ? { ...fallback } : null;
 }
 
-export function hasZeroExecutionEvidence(evidence = {}) {
-  const arrays = [evidence.commandExecutions, evidence.fileChanges, evidence.messages];
-  if (arrays.some((value) => Array.isArray(value) && value.length > 0)) {
+export function hasZeroExecutionEvidence(evidence) {
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) {
     return false;
   }
-  return !(
-    evidence.agentMessageSeen ||
-    evidence.finalAnswerSeen ||
-    evidence.collaborationSeen ||
-    evidence.subagentActivity ||
-    Number(evidence.itemEvents ?? 0) > 0 ||
-    Number(evidence.commandExecutionCount ?? 0) > 0 ||
-    Number(evidence.fileChangeCount ?? 0) > 0
+
+  const booleanFields = ["agentMessageSeen", "finalAnswerSeen", "collaborationSeen", "subagentActivity"];
+  const arrayFields = ["commandExecutions", "fileChanges", "messages"];
+  if (booleanFields.some((field) => evidence[field] !== false)) {
+    return false;
+  }
+  if (arrayFields.some((field) => !Array.isArray(evidence[field]) || evidence[field].length !== 0)) {
+    return false;
+  }
+  if (typeof evidence.itemEvents !== "number" || !Number.isFinite(evidence.itemEvents) || evidence.itemEvents !== 0) {
+    return false;
+  }
+
+  return ["commandExecutionCount", "fileChangeCount"].every(
+    (field) => !(field in evidence) || (typeof evidence[field] === "number" && Number.isFinite(evidence[field]) && evidence[field] === 0)
   );
 }
 
@@ -201,6 +209,7 @@ export async function runWithCapacityFallback({
   resumeThreadId = null,
   runAttempt,
   beforeRetry = async () => true,
+  beforeAttempt = async () => true,
   onFallback = null
 }) {
   let firstResult = null;
@@ -257,6 +266,15 @@ export async function runWithCapacityFallback({
   }
 
   onFallback?.(retry);
+  // This is the final awaited cancellation barrier before attempt #2 starts.
+  // A cancellation that wins after it resolves is handled by the tracked-job
+  // cancellation path; no later async work is introduced before runAttempt.
+  if (!(await beforeAttempt(retry))) {
+    if (firstError) {
+      throw firstError;
+    }
+    return firstResult;
+  }
   const secondResult = await runAttempt(retry);
   return {
     ...secondResult,
