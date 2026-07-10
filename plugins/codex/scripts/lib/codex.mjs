@@ -322,6 +322,10 @@ function createTurnCaptureState(threadId, options = {}) {
     finalTurn: null,
     completed: false,
     finalAnswerSeen: false,
+    agentMessageSeen: false,
+    collaborationSeen: false,
+    subagentActivity: false,
+    itemEvents: 0,
     pendingCollaborations: new Set(),
     activeSubagentTurns: new Set(),
     completionTimer: null,
@@ -404,7 +408,9 @@ function belongsToTurn(state, message) {
 }
 
 function recordItem(state, item, lifecycle, threadId = null) {
+  state.itemEvents += 1;
   if (item.type === "collabAgentToolCall") {
+    state.collaborationSeen = true;
     if (!threadId || threadId === state.threadId) {
       if (lifecycle === "started" || item.status === "inProgress") {
         state.pendingCollaborations.add(item.id);
@@ -419,6 +425,7 @@ function recordItem(state, item, lifecycle, threadId = null) {
   }
 
   if (item.type === "agentMessage") {
+    state.agentMessageSeen = true;
     state.messages.push({
       lifecycle,
       phase: item.phase ?? null,
@@ -506,6 +513,7 @@ function applyTurnNotification(state, message) {
       registerThread(state, message.params.threadId);
       state.threadTurnIds.set(message.params.threadId, message.params.turn.id);
       if ((message.params.threadId ?? null) !== state.threadId) {
+        state.subagentActivity = true;
         state.activeSubagentTurns.add(message.params.threadId);
       }
       emitProgress(
@@ -604,6 +612,11 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     }
 
     return await state.completion;
+  } catch (error) {
+    if (error && typeof error === "object") {
+      error.codexTurnState = state;
+    }
+    throw error;
   } finally {
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
@@ -1098,8 +1111,13 @@ export async function runAppServerTurn(cwd, options = {}) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
-  return withAppServer(cwd, async (client) => {
+  return withAppServer(cwd, (client) => runAppServerTurnWithClient(client, cwd, options));
+}
+
+export async function runAppServerTurnWithClient(client, cwd, options = {}) {
     let threadId;
+    let effectiveModel = options.model ?? null;
+    let effectiveEffort = options.effort ?? null;
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
@@ -1109,6 +1127,8 @@ export async function runAppServerTurn(cwd, options = {}) {
         ephemeral: false
       });
       threadId = response.thread.id;
+      effectiveModel = options.model ?? response.model ?? null;
+      effectiveEffort = options.effort ?? response.reasoningEffort ?? null;
     } else {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
       const response = await startThread(client, cwd, {
@@ -1118,6 +1138,8 @@ export async function runAppServerTurn(cwd, options = {}) {
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
       });
       threadId = response.thread.id;
+      effectiveModel = options.model ?? response.model ?? null;
+      effectiveEffort = options.effort ?? response.reasoningEffort ?? null;
     }
 
     emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", {
@@ -1129,19 +1151,41 @@ export async function runAppServerTurn(cwd, options = {}) {
       throw new Error("A prompt is required for this Codex run.");
     }
 
-    const turnState = await captureTurn(
-      client,
-      threadId,
-      () =>
-        client.request("turn/start", {
-          threadId,
-          input: buildTurnInput(prompt),
-          model: options.model ?? null,
-          effort: options.effort ?? null,
-          outputSchema: options.outputSchema ?? null
-        }),
-      { onProgress: options.onProgress }
-    );
+    let turnState;
+    try {
+      turnState = await captureTurn(
+        client,
+        threadId,
+        () =>
+          client.request("turn/start", {
+            threadId,
+            input: buildTurnInput(prompt),
+            model: options.model ?? null,
+            effort: options.effort ?? null,
+            outputSchema: options.outputSchema ?? null
+          }),
+        { onProgress: options.onProgress }
+      );
+    } catch (error) {
+      if (error && typeof error === "object") {
+        const state = error.codexTurnState ?? {};
+        error.threadId = threadId;
+        error.transport = client.transport ?? null;
+        error.effectiveModel = effectiveModel;
+        error.effectiveEffort = effectiveEffort;
+        error.codexExecutionEvidence = {
+          itemEvents: state.itemEvents ?? 0,
+          agentMessageSeen: Boolean(state.agentMessageSeen),
+          finalAnswerSeen: Boolean(state.finalAnswerSeen),
+          collaborationSeen: Boolean(state.collaborationSeen),
+          subagentActivity: Boolean(state.subagentActivity),
+          messages: state.messages ?? [],
+          fileChanges: state.fileChanges ?? [],
+          commandExecutions: state.commandExecutions ?? []
+        };
+      }
+      throw error;
+    }
 
     return {
       status: buildResultStatus(turnState),
@@ -1152,11 +1196,23 @@ export async function runAppServerTurn(cwd, options = {}) {
       turn: turnState.finalTurn,
       error: turnState.error,
       stderr: cleanCodexStderr(client.stderr),
+      transport: client.transport ?? null,
+      effectiveModel,
+      effectiveEffort,
       fileChanges: turnState.fileChanges,
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
-      commandExecutions: turnState.commandExecutions
+      commandExecutions: turnState.commandExecutions,
+      executionEvidence: {
+        itemEvents: turnState.itemEvents,
+        agentMessageSeen: turnState.agentMessageSeen,
+        finalAnswerSeen: turnState.finalAnswerSeen,
+        collaborationSeen: turnState.collaborationSeen,
+        subagentActivity: turnState.subagentActivity,
+        messages: turnState.messages,
+        fileChanges: turnState.fileChanges,
+        commandExecutions: turnState.commandExecutions
+      }
     };
-  });
 }
 
 export async function findLatestTaskThread(cwd) {
