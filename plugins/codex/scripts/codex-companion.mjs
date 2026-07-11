@@ -22,6 +22,13 @@ import {
     runAppServerTurn
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
+import {
+  acquireCapacityFallbackClaim,
+  normalizeCapacityFallbackMode,
+  persistCapacityFallbackMetadata,
+  runWithCapacityFallback,
+  STOP_REVIEW_TASK_MARKER
+} from "./lib/capacity-fallback.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
@@ -30,6 +37,7 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  resolveJobFile,
   setConfig,
   upsertJob,
   writeJobFile
@@ -70,7 +78,6 @@ const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
-const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function printUsage() {
   console.log(
@@ -79,7 +86,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--capacity-fallback <off|noncritical>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -482,16 +489,72 @@ async function executeTaskRun(request) {
     throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
   }
 
-  const result = await runAppServerTurn(workspaceRoot, {
-    resumeThreadId,
-    prompt: request.prompt,
-    defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
+  const result = await runWithCapacityFallback({
+    mode: request.capacityFallback ?? "off",
+    jobClass: "task",
+    write: Boolean(request.write),
     model: request.model,
     effort: request.effort,
-    sandbox: request.write ? "workspace-write" : "read-only",
-    onProgress: request.onProgress,
-    persistThread: true,
-    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
+    prompt: request.prompt,
+    resumeThreadId,
+    runAttempt: ({ model, effort, resumeThreadId: attemptThreadId }) =>
+      runAppServerTurn(workspaceRoot, {
+        resumeThreadId: attemptThreadId,
+        prompt: request.prompt,
+        defaultPrompt: attemptThreadId ? DEFAULT_CONTINUE_PROMPT : "",
+        model,
+        effort,
+        sandbox: request.write ? "workspace-write" : "read-only",
+        onProgress: request.onProgress,
+        persistThread: true,
+        threadName: attemptThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
+      }),
+    beforeRetry: async (retry) => {
+      if (!request.jobId) {
+        return false;
+      }
+      const claim = acquireCapacityFallbackClaim({
+        jobFile: resolveJobFile(workspaceRoot, request.jobId),
+        jobId: request.jobId,
+        readStoredJob: () => readStoredJob(workspaceRoot, request.jobId)
+      });
+      if (!claim.acquired) {
+        return false;
+      }
+      return true;
+    },
+    beforeAttempt: async (retry) => {
+      if (!request.jobId) {
+        return false;
+      }
+      const currentJob = readStoredJob(workspaceRoot, request.jobId);
+      if (!currentJob || currentJob.status === "cancelled") {
+        return false;
+      }
+      const persisted = persistCapacityFallbackMetadata({
+        workspaceRoot,
+        jobId: request.jobId,
+        fallback: retry,
+        readStoredJob,
+        writeJobFile,
+        upsertJob,
+        fallbackAt: nowIso(),
+        attemptStarting: true
+      });
+      if (!persisted) {
+        return false;
+      }
+      // writeJobFile commits this attempt-state transition by write-then-rename.
+      // Re-read at the final gate so a concurrent cancellation wins before spawn.
+      const readyJob = readStoredJob(workspaceRoot, request.jobId);
+      return Boolean(readyJob && readyJob.status !== "cancelled");
+    },
+    onFallback: (retry) => {
+      request.onProgress?.({
+        message: `Capacity fallback: retrying ${retry.fromModel} on ${retry.model} at ${retry.effort} effort.`,
+        phase: "starting"
+      });
+    }
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
@@ -513,7 +576,8 @@ async function executeTaskRun(request) {
     threadId: result.threadId,
     rawOutput,
     touchedFiles: result.touchedFiles,
-    reasoningSummary: result.reasoningSummary
+    reasoningSummary: result.reasoningSummary,
+    ...(result.capacityFallback ? { capacityFallback: result.capacityFallback } : {})
   };
 
   return {
@@ -601,11 +665,12 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, capacityFallback, prompt, write, resumeLast, jobId }) {
   return {
     cwd,
     model,
     effort,
+    capacityFallback,
     prompt,
     write,
     resumeLast,
@@ -661,11 +726,27 @@ async function runForegroundCommand(job, runner, options = {}) {
     stderr: !options.json
   });
   const execution = await runTrackedJob(job, () => runner(progress), { logFile });
+  persistCompletedCapacityFallback(job.workspaceRoot, job.id, execution);
   outputResult(options.json ? execution.payload : execution.rendered, options.json);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;
   }
   return execution;
+}
+
+function persistCompletedCapacityFallback(workspaceRoot, jobId, execution) {
+  const fallback = execution?.payload?.capacityFallback;
+  if (!fallback) {
+    return;
+  }
+  persistCapacityFallbackMetadata({
+    workspaceRoot,
+    jobId,
+    fallback,
+    readStoredJob,
+    writeJobFile,
+    upsertJob
+  });
 }
 
 function spawnDetachedTaskWorker(cwd, jobId) {
@@ -761,7 +842,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    valueOptions: ["model", "effort", "capacity-fallback", "cwd", "prompt-file"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
@@ -772,6 +853,7 @@ async function handleTask(argv) {
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
+  const capacityFallback = normalizeCapacityFallbackMode(options["capacity-fallback"]);
   const prompt = readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
@@ -794,6 +876,7 @@ async function handleTask(argv) {
       cwd,
       model,
       effort,
+      capacityFallback,
       prompt,
       write,
       resumeLast,
@@ -812,6 +895,7 @@ async function handleTask(argv) {
         cwd,
         model,
         effort,
+        capacityFallback,
         prompt,
         write,
         resumeLast,
@@ -865,7 +949,7 @@ async function handleTaskWorker(argv) {
       logFile: storedJob.logFile ?? null
     }
   );
-  await runTrackedJob(
+  const execution = await runTrackedJob(
     {
       ...storedJob,
       workspaceRoot,
@@ -878,6 +962,7 @@ async function handleTaskWorker(argv) {
       }),
     { logFile }
   );
+  persistCompletedCapacityFallback(workspaceRoot, storedJob.id, execution);
 }
 
 async function handleStatus(argv) {
