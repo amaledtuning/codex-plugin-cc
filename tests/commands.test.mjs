@@ -170,6 +170,29 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(readme, /### `\/codex:cancel`/);
 });
 
+test("rescue forwards capacity fallback as a validated runtime control", () => {
+  const rescue = read("commands/rescue.md");
+  const agent = read("agents/codex-rescue.md");
+  const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
+
+  assert.match(rescue, /--capacity-fallback <off\|noncritical>/);
+  assert.match(rescue, /accepted values are `off` and `noncritical`/i);
+  assert.match(rescue, /reject the request before invoking the subagent/i);
+  assert.match(rescue, /remove `--capacity-fallback <value>` from the natural-language task text/i);
+  assert.match(rescue, /forward it to `task` exactly once/i);
+
+  for (const source of [agent, runtimeSkill]) {
+    assert.match(source, /accepted values are `off` and `noncritical`/i);
+    assert.match(source, /unknown value/i);
+    assert.match(source, /remove `--capacity-fallback <value>` from the task text/i);
+    assert.match(source, /pass `--capacity-fallback <value>` to `task` exactly once/i);
+    assert.match(source, /default remains `off`/i);
+  }
+
+  assert.match(agent, /Treat `--capacity-fallback <value>` as a runtime control/i);
+  assert.match(runtimeSkill, /If the forwarded request includes `--capacity-fallback`/i);
+});
+
 test("transfer, result, and cancel commands are exposed as deterministic runtime entrypoints", () => {
   const transfer = read("commands/transfer.md");
   const result = read("commands/result.md");
