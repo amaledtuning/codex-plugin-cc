@@ -137,7 +137,7 @@ Use it when you want Codex to:
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
+It supports `--background`, `--wait`, `--resume`, `--fresh`, and the opt-in `--capacity-fallback off|noncritical` runtime control. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
 
 Examples:
 
@@ -148,6 +148,7 @@ Examples:
 /codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
 /codex:rescue --model spark fix the issue quickly
 /codex:rescue --background investigate the regression
+/codex:rescue --fresh --wait --model gpt-5.6-luna --effort medium --capacity-fallback noncritical read-only: investigate the regression without changing files
 ```
 
 You can also just ask for a task to be delegated to Codex:
@@ -161,6 +162,10 @@ Ask Codex to redesign the database connection to be more resilient.
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
+- capacity fallback is off by default; `noncritical` applies only to read-only `task`/rescue runs (`write=false`) on allowlisted GPT-5.6 models below `xhigh`
+- the fallback performs at most one same-thread retry and never cascades; it requires zero execution evidence, including no agent message, item activity, command, file change, or collaboration/subagent activity
+- only the normalized errors `selected model is at capacity` and `selected model is at capacity. please try a different model` are allowlisted
+- write-capable, `xhigh`, critical/live, stop-review, non-GPT-5.6, and already-started work fail closed without a retry
 
 ### `/codex:transfer`
 
